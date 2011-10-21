@@ -19,6 +19,7 @@
 #define __ARCHWRITER_H__
 
 #include <limits.h>
+#include <sys/stat.h>
 #include "strlist.h"
 
 struct s_writebuf;
@@ -28,6 +29,8 @@ struct s_strlist;
 
 struct s_archwriter;
 typedef struct s_archwriter carchwriter;
+
+typedef int (*fp_write)(carchwriter *ai, void *data, s64 size);
 
 struct s_archwriter
 {   int    archfd; // file descriptor of the current volume (set to -1 when closed)
@@ -40,6 +43,14 @@ struct s_archwriter
     char   basepath[PATH_MAX]; // path of the first volume of an archive
     char   volpath[PATH_MAX]; // path of the current volume of an archive
     cstrlist vollist; // paths to all volumes of an archive
+    s64    currentpos; // the current position in the output stream
+    bool   piped; // archwriter object in piped mode?
+    u8*    cache; // a pointer to cached input data that should be re-scaned
+    u8*    cachewrite; // write pointer in the cached data stream
+    u32    cachesize; // the cache input data size
+    s64    devblocksize; // the underlying device's block size
+    int    originaltapeblocksize; // store the tape block size to restore it
+    fp_write write; // the write function
 };
 
 int archwriter_init(carchwriter *ai);

@@ -281,12 +281,12 @@ int strlist_show(cstrlist *l)
     
     if (!l->head)
     {   
-        printf("list is empty");
+        msgprintf(MSG_DEBUG1, "list is empty");
     }
     else
     {
         for (item=l->head; (item!=NULL); item=item->next)
-            printf("item[%d]: [%s]\n", count++, item->str);
+            msgprintf(MSG_DEBUG1, "item[%d]: [%s]\n", count++, item->str);
     }
     
     return 0;

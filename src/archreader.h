@@ -19,6 +19,7 @@
 #define __ARCHREADER_H__
 
 #include <limits.h>
+#include <sys/stat.h>
 
 struct s_blockinfo;
 struct s_headinfo;
@@ -26,6 +27,9 @@ struct s_dico;
 
 struct s_archreader;
 typedef struct s_archreader carchreader;
+
+typedef int (*fp_read)(carchreader *ai, u64 size);
+typedef int (*fp_skip)(carchreader *ai, s64 offset);
 
 struct s_archreader
 {   int    archfd; // file descriptor of the current volume (set to -1 when closed)
@@ -46,6 +50,16 @@ struct s_archreader
     char   label[FSA_MAX_LABELLEN]; // archive label defined by the user
     char   basepath[PATH_MAX]; // path of the first volume of an archive
     char   volpath[PATH_MAX]; // path of the current volume of an archive
+    s64    currentpos; // the current position in the stream 
+    u8*    cache; // a pointer to cached input data that should be re-scaned
+    u8*    cacheread; // read pointer in the cached data stream
+    u8*    cachewrite; // write pointer in the cached data stream
+    u32    cachesize; // the cache input data size
+    s64    devblocksize; // the underlying device's block size
+    int    originaltapeblocksize; // store the tape block size to restore it  
+    bool   polling; // poll in select mode
+    fp_read read; // the read method
+    fp_skip skip; // the skip method
 };
 
 int archreader_init(carchreader *ai);

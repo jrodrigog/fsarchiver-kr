@@ -291,7 +291,7 @@ int strdico_print(cstrdico *d)
     assert(d);
     
     for (item=d->head; item!=NULL; item=item->next)
-        printf("item[%d]: key=[%s] value=[%s]\n", pos++, item->key, item->value);
+        msgprintf(MSG_FORCE, "item[%d]: key=[%s] value=[%s]\n", pos++, item->key, item->value);
     
     return FSAERR_SUCCESS;
 }

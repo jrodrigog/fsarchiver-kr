@@ -590,10 +590,19 @@ int get_path_to_volume(char *newvolbuf, int bufsize, char *basepath, long curvol
     char prefix[PATH_MAX];
     int pathlen;
     
+    if (strcmp(basepath, "-")==0)
+    {
+        snprintf(newvolbuf, bufsize, "%s", basepath);        
+        return 0;
+    }
+    pathlen=strlen(basepath);
+	/*
+	// Avoid this check here to allow any device
     if ((pathlen=strlen(basepath))<4) // all archives terminates with ".fsa"
     {   errprintf("archive has an invalid basepath: [%s]\n", basepath);
         return -1;
     }
+	*/
     
     if (curvol==0) // first volume
     {

@@ -171,7 +171,7 @@ void *thread_reader_fct(void *args)
     // read all other data from file (filesys-header, normal objects headers, ...)
     while (endofarchive==false && get_stopfillqueue()==false)
     {
-        if ((res=archreader_read_header(ai, magic, &dico, true, &fsid))!=FSAERR_SUCCESS)
+        if ((res=archreader_read_header(ai, magic, &dico, false, &fsid))!=FSAERR_SUCCESS)
         {   dico_destroy(dico);
             msgprintf(MSG_STACK, "archreader_read_header() failed to read next header\n");
             if (res==OLDERR_MINOR) // header is corrupt or not what we expected

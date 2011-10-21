@@ -1132,7 +1132,7 @@ int oper_save(char *archive, int argc, char **argv, int archtype)
     archwriter_generate_id(&save.ai);
     
     // pass options to archive
-    path_force_extension(save.ai.basepath, PATH_MAX, archive, ".fsa");
+    snprintf(save.ai.basepath, PATH_MAX, "%s", archive);
     
     // init misc data struct to zero
     thread_writer=0;

@@ -25,6 +25,10 @@
 #include <fcntl.h>
 #include <sys/statvfs.h>
 #include <sys/stat.h>
+#include <sys/mtio.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <linux/major.h>
 #include <assert.h>
 
 #include "fsarchiver.h"
@@ -38,8 +42,11 @@
 #include "comp_bzip2.h"
 #include "error.h"
 
-#define FSA_SMB_SUPER_MAGIC 0x517B
-#define FSA_CIFS_MAGIC_NUMBER 0xFF534D42
+int archwriter_precache(carchwriter *ai, u64 size);
+int archwriter_write_regular(carchwriter *ai, void *data, s64 size);
+int archwriter_write_blocks(carchwriter *ai, void *data, s64 size);
+int archwriter_write_flush(carchwriter *ai, void *data, s64 size);
+int archwriter_check_disk_space(carchwriter *ai);
 
 int archwriter_init(carchwriter *ai)
 {
@@ -50,6 +57,13 @@ int archwriter_init(carchwriter *ai)
     ai->archfd=-1;
     ai->archid=0;
     ai->curvol=0;
+    ai->currentpos=0;
+    ai->devblocksize=0;
+    ai->cache=NULL;
+    ai->cachewrite=NULL;
+    ai->cachesize=0;
+    ai->write=NULL;
+    ai->originaltapeblocksize=-1;
     return 0;
 }
 
@@ -69,10 +83,10 @@ int archwriter_generate_id(carchwriter *ai)
 
 int archwriter_create(carchwriter *ai)
 {
-    //char testpath[PATH_MAX];
-    //struct statfs svfs;
-    //int tempfd;
     struct stat64 st;
+    struct mtget status;
+    struct mtop operation;
+    struct sockaddr_un address;
     long archflags=0;
     long archperm;
     int res;
@@ -81,66 +95,147 @@ int archwriter_create(carchwriter *ai)
     
     // init
     memset(&st, 0, sizeof(st));
-    archflags=O_RDWR|O_CREAT|O_TRUNC|O_LARGEFILE;
+    archflags=O_RDWR|O_LARGEFILE;
     archperm=S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH;
     
-    // if the archive already exists and is a not regular file
-    res=stat64(ai->volpath, &st);
-    if (res==0 && !S_ISREG(st.st_mode))
-    {   errprintf("%s already exists, and is not a regular file.\n", ai->basepath);
-        return -1;
+    if (strcmp(ai->volpath, "-")==0)
+    {   // go fully unbuffered on piped operation
+        setvbuf(stdout, 0, _IONBF, 0);
+        ai->archfd=STDOUT_FILENO;
+        ai->write=&archwriter_write_flush;
     }
-    else if ((g_options.overwrite==0) && (res==0) && S_ISREG(st.st_mode)) // archive exists and is a regular file
-    {   errprintf("%s already exists, please remove it first.\n", ai->basepath);
-        return -1;
+    else
+    {
+        // get stats only for regular files
+        res=stat64(ai->volpath, &st);
+        if ((g_options.overwrite==0) && (res==0) && S_ISREG(st.st_mode))
+        {   errprintf("%s already exists, please remove it first.\n", ai->basepath);
+            return -1;
+        }
+        else if ((res!=0) || S_ISREG(st.st_mode))
+        {   // there is no file, create it
+            ai->write=&archwriter_write_regular;
+            archflags|=O_CREAT|O_TRUNC;
+            ai->newarch=true;
+            path_force_extension(ai->basepath, PATH_MAX, ai->basepath, ".fsa");
+        }
+        else if (S_ISBLK(st.st_mode))
+        {
+            ai->write=&archwriter_write_blocks;
+            ai->devblocksize=st.st_blksize;
+        }
+        else if (S_ISSOCK(st.st_mode))
+        {
+            ai->write=&archwriter_write_flush;
+            
+            if ((ai->archfd=socket(PF_UNIX, SOCK_STREAM, 0))<0)
+            {   errprintf("cannot create a socket\n");
+                return 1;
+            }
+
+            // setup the address structure
+            memset(&address, 0, sizeof(struct sockaddr_un));
+            address.sun_family = AF_UNIX;
+            snprintf(address.sun_path, UNIX_PATH_MAX, "%s", ai->volpath);
+
+            if (connect(ai->archfd, (struct sockaddr *) &address, sizeof(struct sockaddr_un))!=0)
+            {   printf("cannot connect to %s\n", ai->volpath);
+                return 1;
+            }
+        }
+        else if (S_ISCHR(st.st_mode) || S_ISFIFO(st.st_mode))
+        {
+            ai->write=&archwriter_write_flush;
+        }
+        else
+        {   errprintf("%s is not a file that can be handled\n", ai->basepath);
+            return -1;
+        }
+     
+        if (ai->archfd==-1)
+        {
+            ai->archfd=open64(ai->volpath, archflags, archperm);
+            if (ai->archfd < 0)
+            {   sysprintf ("cannot create archive %s\n", ai->volpath);
+                return -1;
+            }
+        }
+        
+        if (S_ISCHR(st.st_mode) && (major(st.st_rdev)==SCSI_TAPE_MAJOR))
+        {
+            if (ioctl(ai->archfd, MTIOCGET, (char *)&status)<0) 
+            {   errprintf("cannot get the tape status for %s ioctl() failed\n", ai->basepath);
+                close(ai->archfd);
+                return -1;
+            }
+            ai->write=&archwriter_write_blocks;
+            ai->devblocksize=FSA_TAPE_BLOCK;
+            ai->originaltapeblocksize=(status.mt_gstat>>MT_ST_BLKSIZE_SHIFT)&MT_ST_BLKSIZE_MASK;
+            if (ai->devblocksize!=ai->originaltapeblocksize)
+            {
+                operation.mt_op=MTSETBLK;
+                operation.mt_count=ai->devblocksize&MT_ST_BLKSIZE_MASK;
+                if (ioctl(ai->archfd, MTIOCTOP, (char *)&operation)<0) 
+                {   errprintf("cannot set the tape block size to %d ioctl() failed\n", operation.mt_count);
+                    close(ai->archfd);
+                    return -1;
+                }            
+            }
+        }
     }
-    
-    // check if it's a network filesystem
-    /*snprintf(testpath, sizeof(testpath), "%s.test", ai->volpath);
-    if (((tempfd=open64(testpath, basicflags, archperm))<0) ||
-        (fstatfs(tempfd, &svfs)!=0) ||
-        (close(tempfd)!=0) ||
-        (unlink(testpath)!=0))
-    {   errprintf("Cannot check the filesystem type on file %s\n", testpath);
-        return -1;
-    }
-    
-    if (svfs.f_type==FSA_CIFS_MAGIC_NUMBER || svfs.f_type==FSA_SMB_SUPER_MAGIC)
-    {   sysprintf ("writing an archive on a smbfs/cifs filesystem is "
-            "not allowed, since it can produce corrupt archives.\n");
-        return -1;
-    }*/
-    
-    ai->archfd=open64(ai->volpath, archflags, archperm);
-    if (ai->archfd < 0)
-    {   sysprintf ("cannot create archive %s\n", ai->volpath);
-        return -1;
-    }
-    ai->newarch=true;
-    
+        
     strlist_add(&ai->vollist, ai->volpath);
-    
-    /* lockf is causing corruption when the archive is written on a smbfs/cifs filesystem */
-    /*if (lockf(ai->archfd, F_LOCK, 0)!=0)
-    {   sysprintf("Cannot lock archive file: %s\n", ai->volpath);
-        close(ai->archfd);
-        return -1;
-    }*/
-    
+    ai->currentpos=0;
+    msgprintf(MSG_DEBUG2,"block size at: %ld\n", ai->devblocksize);
+
     return 0;
 }
 
 int archwriter_close(carchwriter *ai)
 {
+    struct mtop operation;
+    long lres, pending;
+
     assert(ai);
     
     if (ai->archfd<0)
         return -1;
-    
-    //res=lockf(ai->archfd, F_ULOCK, 0);
+
+    pending=ai->cachewrite-ai->cache;
+    if (ai->cache && pending)
+    {
+	memset(ai->cachewrite, 0, ai->devblocksize-pending);
+        if ((lres=write(ai->archfd, ai->cache, ai->devblocksize))!=ai->devblocksize)
+        {   
+            errprintf("flush bytes: write(%ld)=%ld failed\n", ai->devblocksize, lres);
+            return -1;
+        }
+    }
+
     fsync(ai->archfd); // just in case the user reboots after it exits
+
+    // restore the original tape block size, if required
+    if ((ai->originaltapeblocksize!=-1) && (ai->originaltapeblocksize!=ai->devblocksize))
+    {
+        operation.mt_op=MTSETBLK;
+        operation.mt_count=ai->originaltapeblocksize&MT_ST_BLKSIZE_MASK;
+        if ((lres=ioctl(ai->archfd, MTIOCTOP, (char *)&operation))<0) 
+        {
+            errprintf("cannot set the tape block size to %d: ioctl()=%ld failed\n", operation.mt_count, lres);
+        }
+    }
+    
     close(ai->archfd);
     ai->archfd=-1;
+   
+    // free the cache buffer if it has been allocated
+    if (ai->cache)
+    {
+        free(ai->cache);
+        ai->cache=NULL;
+        ai->cachewrite=NULL;
+        ai->cachesize=0;
+    }
     
     return 0;
 }
@@ -178,55 +273,29 @@ int archwriter_remove(carchwriter *ai)
 s64 archwriter_get_currentpos(carchwriter *ai)
 {
     assert(ai);
-    return (s64)lseek64(ai->archfd, 0, SEEK_CUR);
+    return ai->currentpos;
 }
 
 int archwriter_write_buffer(carchwriter *ai, struct s_writebuf *wb)
 {
-    struct statvfs64 statvfsbuf;
-    char textbuf[128];
-    long lres;
-    
     assert(ai);
-    assert(wb);
     
-    if (wb->size <=0)
-    {   errprintf("wb->size=%ld\n", (long)wb->size);
+    if (wb->size<0)
+    {   // something is not going well if we have to write negative bytes
         return -1;
     }
-    
-    if ((lres=write(ai->archfd, (char*)wb->data, (long)wb->size))!=(long)wb->size)
-    {
-        errprintf("write(size=%ld) returned %ld\n", (long)wb->size, (long)lres);
-        if ((lres>0) && (lres < (long)wb->size)) // probably "no space left"
-        {
-            if (fstatvfs64(ai->archfd, &statvfsbuf)!=0)
-            {   sysprintf("fstatvfs(fd=%d) failed\n", ai->archfd);
-                return -1;
-            }
-            
-            u64 freebytes = statvfsbuf.f_bfree * statvfsbuf.f_bsize;
-            errprintf("Can't write to the archive file. Space on device is %s. \n"
-                "If the archive is being written to a FAT filesystem, you may have reached \n"
-                "the maximum filesize that it can handle (in general 2 GB)\n", 
-                format_size(freebytes, textbuf, sizeof(textbuf), 'h'));
-            return -1;
-        }
-        else // another error
-        {
-            sysprintf("write(size=%ld) failed\n", (long)wb->size);
-            return -1;
-        }
+    else if (wb->size==0)
+    {   // no data to be written
+        return 0;
     }
     
-    return 0;
+    return ai->write(ai, wb->data, wb->size);
 }
 
 int archwriter_volpath(carchwriter *ai)
 {
-    int res;
-    res=get_path_to_volume(ai->volpath, PATH_MAX, ai->basepath, ai->curvol);
-    return res;
+    assert(ai);
+    return get_path_to_volume(ai->volpath, PATH_MAX, ai->basepath, ai->curvol);
 }
 
 int archwriter_is_path_to_curvol(carchwriter *ai, char *path)
@@ -314,7 +383,7 @@ int archwriter_write_volfooter(carchwriter *ai, bool lastvol)
     
     // write header to file
     if (archwriter_write_buffer(ai, wb)!=0)
-    {   msgprintf(MSG_STACK, "archwriter_write_data(size=%ld) failed\n", (long)wb->size);
+    {   msgprintf(MSG_STACK, "archwriter_write_buffer(size=%ld) failed\n", (long)wb->size);
         return -1;
     }
     
@@ -426,5 +495,136 @@ int archwriter_dowrite_header(carchwriter *ai, struct s_headinfo *headinfo)
     }
     
     writebuf_destroy(wb);
+    return 0;
+}
+
+int archwriter_check_disk_space(carchwriter *ai)
+{
+    assert(ai);
+    struct statvfs64 statvfsbuf;
+    char textbuf[128];
+    
+    if (fstatvfs64(ai->archfd, &statvfsbuf)!=0)
+    {   sysprintf("fstatvfs(fd=%d) failed\n", ai->archfd);
+            return -1;
+    }
+
+    u64 freebytes = statvfsbuf.f_bfree * statvfsbuf.f_bsize;
+    errprintf("Can't write to the archive file. Space on device is %s. \n"
+            "If the archive is being written to a FAT filesystem, you may have reached \n"
+            "the maximum filesize that it can handle (in general 2 GB)\n", 
+            format_size(freebytes, textbuf, sizeof(textbuf), 'h'));
+    
+    return 0;
+}
+
+int archwriter_precache(carchwriter *ai, u64 size)
+{
+    u8* victim;
+    s64 offsetwrite, xmod;
+    
+    assert(ai);
+    
+    if ((ai->cachewrite+size)<=(ai->cache+ai->cachesize))
+    {   // there is enough room for the new data
+        return 0;
+    }
+    
+    // grow the buffer
+    victim=ai->cache;
+    offsetwrite=ai->cachewrite-ai->cache;
+    ai->cachesize=((size/g_options.datablocksize)+1)*g_options.datablocksize;
+    xmod=ai->cachesize%ai->devblocksize;
+    ai->cachesize+=xmod==0?0:ai->devblocksize-xmod;
+    assert((ai->cachesize%ai->devblocksize)==0);
+    
+    if ((ai->cache=malloc(ai->cachesize))==NULL)
+    {   errprintf("cannot allocate block: malloc(%d) failed\n", ai->cachesize);
+        return -1;
+    }
+    
+    if (victim)
+    {   // copy the previously buffered data
+        memcpy(ai->cache, victim, offsetwrite);
+        free(victim);
+    }
+
+    ai->cachewrite=ai->cache+offsetwrite;
+    msgprintf(MSG_DEBUG2,"cache buffer at: %d\n",ai->cachesize);
+    
+    return 0;
+}
+
+int archwriter_write_blocks(carchwriter *ai, void *data, s64 size)
+{
+    long lres;
+    s64 xsize, pending;
+    
+    assert(ai);
+    
+    if ((lres=archwriter_precache(ai, size))!=FSAERR_SUCCESS)
+    {   errprintf("archwriter_precache(%ld) failed\n", size);
+        return -1; 
+    }
+
+    // copy the data to the output cache
+    memcpy(ai->cachewrite, data, size);
+    ai->cachewrite+=size;
+    ai->currentpos+=size;
+    
+    xsize=ai->cachewrite-ai->cache;
+    if (xsize>=ai->devblocksize)
+    {
+        pending=xsize%ai->devblocksize;
+        xsize-=pending;
+        if ((lres=write(ai->archfd, ai->cache, xsize))!=xsize)
+        {   sysprintf("write(size=%ld)=%ld failed\n", xsize, lres);
+            return -1;
+        }
+        memcpy(ai->cache, ai->cache+xsize, pending);
+        ai->cachewrite=ai->cache+pending;
+    }
+    
+    return 0;
+}
+
+int archwriter_write_regular(carchwriter *ai, void *data, s64 size)
+{
+    long lres;
+    
+    assert(ai);
+    
+    if ((lres=write(ai->archfd, data, size))!=size)
+    {
+        if ((lres>=0) && (lres<size))
+        {
+            archwriter_check_disk_space(ai);
+            return -1;
+        }
+        else {
+            errprintf("write(size=%ld)=%ld failed\n", size, lres);
+            return -1;
+        }
+    }
+    
+    ai->currentpos+=size;
+    
+    return 0;
+}
+
+int archwriter_write_flush(carchwriter *ai, void *data, s64 size)
+{
+    long lres;
+    
+    assert(ai);
+    
+    if ((lres=write(ai->archfd, data, size))!=size)
+    {   errprintf("write(size=%ld)=%ld failed\n", size, lres);
+        return -1;
+    }
+    fsync(ai->archfd);
+    
+    ai->currentpos+=size;
+    
     return 0;
 }

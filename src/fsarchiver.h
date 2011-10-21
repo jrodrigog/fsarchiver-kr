@@ -158,4 +158,9 @@ extern char *valid_magic[];
 #define FSA_VERSION_GET_C(ver)            ((((u64)ver)>>16)&0xFFFF)
 #define FSA_VERSION_GET_D(ver)            ((((u64)ver)>>0)&0xFFFF)
 
+#define FSA_TAPE_BLOCK 4096
+#define FSA_CACHE_HEADER 64
+
+#define UNIX_PATH_MAX 108 /* man 7 unix */
+
 #endif // __FSARCHIVER_H__
